@@ -4,11 +4,57 @@
 # Email: lk21@mails.tsinghua.edu.cn
 # LastEditTime: 2022-10-04 16:24:53
 ###
-from .frequencydis import MultiFrequencyDiscriminator, FrequencyDiscriminator
+from .frequencydis import (
+    MultiFrequencyDiscriminator,
+    FrequencyDiscriminator,
+    gradient_penalty,
+    r1_penalty,
+)
+from .mpd import MultiPeriodDiscriminator, PeriodDiscriminator
+from .msstft import MultiScaleSTFTDiscriminator, STFTScaleDiscriminator
+from .fast import FastMelBank, FastMelD, FastMPD, FastMRD, FastPD, FastSpecD
+from .dynamics import (
+    EnvelopeDiscriminator,
+    HFModulationBank,
+    HFModulationDiscriminator,
+    MultiEnvelopeDiscriminator,
+    PeriodicityACFDiscriminator,
+    PeriodicityBank,
+    TransientBank,
+    TransientDiscriminator,
+)
+from .combined import (
+    CombinedDiscriminator,
+    build_fast_discriminator,
+    build_hybrid_discriminator,
+)
 
 __all__ = [
     "MultiFrequencyDiscriminator",
-    "FrequencyDiscriminator"
+    "FrequencyDiscriminator",
+    "gradient_penalty",
+    "r1_penalty",
+    "EnvelopeDiscriminator",
+    "MultiEnvelopeDiscriminator",
+    "TransientDiscriminator",
+    "TransientBank",
+    "HFModulationDiscriminator",
+    "HFModulationBank",
+    "PeriodicityACFDiscriminator",
+    "PeriodicityBank",
+    "MultiPeriodDiscriminator",
+    "PeriodDiscriminator",
+    "MultiScaleSTFTDiscriminator",
+    "STFTScaleDiscriminator",
+    "CombinedDiscriminator",
+    "build_hybrid_discriminator",
+    "build_fast_discriminator",
+    "FastMPD",
+    "FastMRD",
+    "FastMelBank",
+    "FastPD",
+    "FastSpecD",
+    "FastMelD",
 ]
 
 

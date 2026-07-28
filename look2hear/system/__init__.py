@@ -8,10 +8,15 @@
 
 from .optimizers import make_optimizer
 from .audio_litmodule import AudioLightningModule
+from .ema import ModelEMA
+from .restoration_litmodule import RestorationLightningModule, VocalLightningModule
 from .schedulers import DPTNetScheduler
 
 __all__ = [
-    "make_optimizer", 
+    "make_optimizer",
     "AudioLightningModule",
+    "ModelEMA",
+    "RestorationLightningModule",
+    "VocalLightningModule",
     "DPTNetScheduler"
 ]

@@ -5,45 +5,17 @@ from typing import Any, Tuple
 import torch
 import random
 from pytorch_lightning import LightningDataModule
-import torchaudio
-from torchaudio.functional import apply_codec
 from torch.utils.data import DataLoader, Dataset
 from typing import Any, Dict, Optional, Tuple
+
+# `torchaudio.functional.apply_codec` no longer exists; see look2hear/datas/codec.py
+from .codec import codec_simu
+from ..inference.audio_io import load_audio
 
 def compute_mch_rms_dB(mch_wav, fs=16000, energy_thresh=-50):
     """Return the wav RMS calculated only in the active portions"""
     mean_square = max(1e-20, torch.mean(mch_wav ** 2))
     return 10 * np.log10(mean_square)
-
-def match2(x, d):
-    assert x.dim()==2, x.shape
-    assert d.dim()==2, d.shape
-    minlen = min(x.shape[-1], d.shape[-1])
-    x, d = x[:,0:minlen], d[:,0:minlen]
-    Fx = torch.fft.rfft(x, dim=-1)
-    Fd = torch.fft.rfft(d, dim=-1)
-    Phi = Fd*Fx.conj()
-    Phi = Phi / (Phi.abs() + 1e-3)
-    Phi[:,0] = 0
-    tmp = torch.fft.irfft(Phi, dim=-1)
-    tau = torch.argmax(tmp.abs(),dim=-1).tolist()
-    return tau
-
-def codec_simu(wav, sr=16000, options={'bitrate':'random','compression':'random', 'complexity':'random', 'vbr':'random'}):
-
-    if options['bitrate'] == 'random':
-        options['bitrate'] = random.choice([24000, 32000, 48000, 64000, 96000, 128000])
-    compression = int(options['bitrate']//1000)
-    param = {'format': "mp3", "compression": compression}
-    wav_encdec = apply_codec(wav, sr, **param)
-    if wav_encdec.shape[-1] >= wav.shape[-1]:
-        wav_encdec = wav_encdec[...,:wav.shape[-1]]
-    else:
-        wav_encdec = torch.cat([wav_encdec, wav[..., wav_encdec.shape[-1]:]], -1)
-    tau = match2(wav, wav_encdec) 
-    wav_encdec = torch.roll(wav_encdec, -tau[0], -1)
-
-    return wav_encdec
 
 def get_wav_files(root_dir):
     wav_files = []
@@ -143,8 +115,8 @@ class MusdbMoisesdbEval(Dataset):
         return len(self.data_path)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        ori_wav = torchaudio.load(self.data_path[idx]+"/ori_wav.wav")[0]
-        codec_wav = torchaudio.load(self.data_path[idx]+"/codec_wav.wav")[0]
+        ori_wav = load_audio(self.data_path[idx]+"/ori_wav.wav")[0]
+        codec_wav = load_audio(self.data_path[idx]+"/codec_wav.wav")[0]
         
         return ori_wav, codec_wav, self.data_path[idx]
     

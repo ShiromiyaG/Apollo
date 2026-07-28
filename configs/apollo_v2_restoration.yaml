@@ -1,0 +1,314 @@
+# Apollo v2 -- lossy -> lossless music restoration, STEREO, trained from scratch.
+#
+#   python scripts/preprocess.py --mode restoration --in_dir ./raw_music --out_dir ./data/music
+#   python train.py --conf_dir=configs/apollo_v2_restoration.yaml
+#
+# NOT checkpoint-compatible with v1: this is a different architecture, so the
+# released Apollo weights cannot be loaded and there is no --init_from shortcut.
+# Budget for a real training run. If you want the released weights, use
+# configs/apollo_restoration.yaml instead.
+#
+# See docs/architecture_v2.md for what changed and why.
+
+exp:
+  dir: ./Exps
+  name: ApolloV2Restoration
+
+seed: 614020
+matmul_precision: high
+
+datas:
+  _target_: look2hear.datas.vocal_datamodule.VocalDataModule
+  train_dir: ./data/music/train
+  eval_dir: ./data/music/valid
+  eval_degraded_dir: null
+  sr: 44100
+  segments: 3.0
+  channels: 2
+  num_samples: 40000
+  gain_range_db: [-6.0, 6.0]
+  min_active_db: -50.0
+  eval_segments: 6.0
+  codec_prob: 0.95
+  # `music` is a bundle (see look2hear/datas/codec.py): the MDCT transform codecs
+  # and the hybrids a music file plausibly went through. It deliberately excludes
+  # the narrowband speech family, which forces 8-16 kHz mono -- a real degradation,
+  # but not one a music file suffers, and it would destroy the stereo image this
+  # config's `stereo_mode: ms` exists to exploit. Anything the install cannot
+  # encode is dropped with a warning at startup.
+  codec_formats: [music]
+  codec_weights:
+    mp3: 4.0                   # still the most likely thing a file has been through
+    aac: 3.0                   # streaming, Apple, most video soundtracks
+    opus: 2.0
+    ogg: 2.0
+    ac3: 1.0                   # video soundtracks
+    wma: 1.0                   # legacy libraries
+    mp2: 0.7                   # broadcast, older archives
+  bitrates: [24, 32, 48, 64, 96, 128]
+  bandlimit_prob: 0.15
+  clip_prob: 0.05
+  quantize_prob: 0.05
+  batch_size: 1
+  num_workers: 4
+
+model:
+  _target_: look2hear.models.apollo_v2.ApolloV2
+  sr: 44100
+  win: 20
+  feature_dim: 256
+  layer: 6
+  # 2 blocks of kernel 11 at dilations (1, 2), six layers deep: 1.81 s of
+  # temporal context against v1's 1.09 s, for 58% fewer parameters
+  icb_blocks: 2
+  icb_kernel: 11
+  icb_mult: 2.5
+  icb_dilations: [1, 2]
+  ffn_mult: 2.67
+  # predict a correction to the input spectrum rather than re-synthesising it;
+  # "leave the low band alone" becomes the default instead of something learned
+  output_mode: residual
+  # lossy codecs joint-stereo-code, so their artefacts are structured in M/S
+  stereo_mode: ms
+  output_init_scale: 0.1
+
+discriminator:
+  _target_: look2hear.discriminators.build_fast_discriminator
+  nch: 2                       # must match datas.channels
+  sample_rate: 44100
+  use_san: true                # bounds each branch's logit without spectral norm
+  use_mpd: true                # period domain, no windowing
+  use_mrd: true                # multi-resolution magnitude
+  use_mel: true                # log-frequency, cheap stand-in for a CQT branch
+  phase_aware: true            # complex-STFT branch: the ONLY thing constraining phase
+  # 18 branches, 12.65M params. Measured on an RTX 5060 8 GB at 3 s stereo, fp32:
+  # branch-wise, the discriminator step peaks at the LARGEST single branch
+  # (mrd_512, 1400 MB); all 18 in one forward needs the sum, about 11.6 GB, which
+  # is more than the card. bf16 roughly halves that, so with autocast_dtype below
+  # the all-at-once step does fit -- `disc_branchwise` is a hard requirement in
+  # fp32 and a 55% memory saving in bf16. Drop use_mrd first if you need memory
+  # back: those three branches are the most expensive and overlap most with mel.
+  periods: [2, 3, 5, 7, 11]
+  mrd_fft_sizes: [2048, 1024, 512]
+  mrd_hop_sizes: [256, 128, 64]
+  mrd_win_lengths: [2048, 1024, 512]
+  mel_fft_sizes: [2048]
+  mel_hop_sizes: [512]
+  mel_win_lengths: [2048]
+  n_mels: 128
+  msstft_n_ffts: [2048, 1024, 512]
+  msstft_freq_stride: 2        # 1 keeps full bin acuity but dominates the cost
+  msstft_mag_compression: 0.3  # without it the branch behaves as a low-band critic
+  # --- dynamics branches (see look2hear/discriminators/dynamics.py) ---
+  # Everything above judges a static picture: what a frame contains. None of it
+  # can express how energy MOVES, which is most of what a codec destroys --
+  # pre-echo, smeared attacks, quantisation noise filling pauses at the right
+  # level with the wrong movement. These four close that gap cheaply: their
+  # analysis front-ends have no trainable parameters and the conv stacks run at
+  # the envelope rate, not the sample rate.
+  use_med: true                # 3 envelope time constants: ~1.5 / 6 / 23 ms
+  use_transient: true          # waveform derivative: attacks, pre-echo
+  use_hf_modulation: true      # 2-10 kHz modulation spectrum, level-invariant
+  use_periodicity: true        # lag-domain ACF: the "plastic" over-regular comb
+  med_channels: 32
+  hf_low_hz: 2000.0
+  hf_high_hz: 10000.0
+  periodicity_f0_min: 70.0
+  periodicity_f0_max: 400.0
+
+# fused: one kernel for the whole parameter update instead of one per tensor.
+# Measured on 22.1M parameters: 4.74 ms -> 1.65 ms per optimizer.step(). Be clear
+# about what that is worth here, though: with accumulate_grad_batches: 8 the
+# optimizers step once per 8 micro-batches, so end to end it is ~0.07% -- 1138 ms
+# against 1126 ms per micro-batch, inside the run-to-run noise. It is free and
+# correct (the module's gradient clipping already handles fused optimizers, which
+# Lightning's generic helper refuses), so it is on; it only starts to matter if
+# you lower the accumulation.
+optimizer_g:
+  _target_: torch.optim.AdamW
+  lr: 0.0008                   # from scratch, so higher than the v1 fine-tune configs
+  weight_decay: 0.01
+  fused: true
+
+optimizer_d:
+  _target_: torch.optim.AdamW
+  lr: 0.0002
+  weight_decay: 0.01
+  betas: [0.5, 0.99]
+  fused: true
+
+scheduler_g:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+scheduler_d:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+# With the balancer on (see system.use_loss_balancer) these weights no longer set
+# the relative importance of the terms -- system.balancer_weights does. They are
+# left at 1.0 because a constant prefactor cancels out of the balancer entirely:
+# it divides by the gradient's own norm, which carries the prefactor with it.
+loss_g:
+  _target_: look2hear.losses.gan_losses.VocalGenLoss
+  sr: 44100
+  freq_weight: 1.0
+  adv_weight: 1.0
+  feature_weight: 1.0
+  fullness_weight: 1.0
+  bleedless_weight: 1.0
+  clarity_weight: 1.0
+  waveform_weight: 1.0
+  fullness_band_weights: null
+  # RpGAN: judge the paired real-vs-fake difference rather than each against an
+  # absolute boundary. Valid here because the generator's input is a degraded copy
+  # of the very target it is scored against, so the pair is a same-condition
+  # contrast. Set to soft_hinge (or lsgan) to drop the relativistic pairing.
+  gan_loss_type: relativistic
+
+loss_d:
+  _target_: look2hear.losses.gan_losses.MultiFrequencyDisLoss
+  eps: 1e-8
+  loss_type: relativistic      # must match loss_g.gan_loss_type
+
+metrics:
+  _target_: look2hear.losses.MultiSrcNegSDR
+  sdr_type: sisdr
+
+system:
+  _target_: look2hear.system.restoration_litmodule.RestorationLightningModule
+  sr: 44100
+  accumulate_grad_batches: 8
+  gradient_clip_val: 5.0
+  # bf16 measured on the full step with the 18-branch bank: 1646 -> 1138 ms
+  # (1.45x) and 2998 -> 2230 MB (-26%). The v1 configs leave this at `none`
+  # because with their 5-branch critic the generator dominated and bf16 bought
+  # nothing; here the critic is a large share of the step, so it pays.
+  #
+  # Safe for this recipe specifically, and the reasons are worth stating:
+  #  * bf16 has fp32's exponent range, so there is no GradScaler and no overflow
+  #    path -- only ~3 significant decimal digits of mantissa;
+  #  * the gradient penalty runs OUTSIDE the autocast context by construction, so
+  #    the double backward stays fp32 (2.7154e-3 against 2.7217e-3 if forced into
+  #    bf16 -- it survives either way, but there is no reason to risk it);
+  #  * the dynamics branches disable autocast on their own front-ends, so the
+  #    sinc filterbanks, envelope detectors and FFTs stay fp32;
+  #  * the loss balancer keeps its gradient-norm statistics in fp32 regardless.
+  #    That one is not cosmetic: at ema_decay 0.999 the update is one part in a
+  #    thousand, which rounds away entirely in bf16 -- measured 0 of 200 updates
+  #    moving a bf16 EMA against 200 of 200 in fp32.
+  # What you do accept is ~1e-2 relative gradient noise, against ~6e-4 in fp32.
+  # Set to `none` if you see the adversarial game destabilise.
+  autocast_dtype: bf16
+  gradient_checkpointing: true
+  ema_decay: 0.999
+  ema_warmup_steps: 2000
+  use_ema_for_validation: true
+  # R3GAN: the relativistic objective above plus a zero-centred gradient penalty on
+  # BOTH sides. r2_gamma is the fake-side half; it has no counterpart in the v1
+  # configs, which penalised the real side only.
+  r1_gamma: 1.0
+  r2_gamma: 1.0
+  r1_every: 16                 # counted in DISCRIMINATOR UPDATES, not micro-batches
+  r1_patch_reduction: mean     # `sum` reproduces pre-fix runs; see docs/gan.md
+  # Penalise each branch's own gradient (mean_b ||g_b||^2) rather than the norm of
+  # the summed field (||mean_b g_b||^2). Not a memory trade with the same meaning:
+  # branch gradients are near-uncorrelated, so the cross terms cancel and the
+  # summed form lands ~n_branches lower -- measured exactly 8.0x on an 8-branch
+  # bank. With disc_branchwise: true this was already the behaviour; setting it
+  # explicitly stops r1_gamma's meaning from riding on an unrelated flag.
+  r1_branchwise: true
+  # Both penalties out of ONE forward and ONE double backward instead of two. The
+  # double backward is what makes a regularisation step expensive, and samples are
+  # independent, so cat([real, fake]) yields both halves' per-sample gradients at
+  # once. Identical numbers; the trade is a larger peak on that one step.
+  r1_r2_joined: true
+  # Hold the critic's LR schedule until the critic has actually stepped. Without
+  # this a StepLR decays through the whole disc_start_step warmup and the critic
+  # wakes up already annealed.
+  hold_disc_scheduler: true
+  disc_start_step: 5000        # from scratch: give reconstruction longer to settle
+  adv_ramp_steps: 5000         # counted in OPTIMIZER WINDOWS
+  disc_branches_per_step: 0    # superseded by disc_branch_every below
+  # forward+backward one branch at a time: peak VRAM tracks the largest single
+  # branch instead of the sum, which is what makes a multi-family bank fit in 8 GB
+  disc_branchwise: true
+  # Stop the per-branch backwards at the generated waveform and accumulate there,
+  # so the generator graph is traversed ONCE instead of once per branch. With 16
+  # branches and gradient checkpointing on, the old path also re-ran the
+  # generator's forward 16 times. Identical gradients -- see tests/test_gan_v2.py.
+  gstep_output_grad: true
+  # One critic forward over cat([real, fake]) instead of two. Every branch
+  # operation is per sample, so this is the same arithmetic in half the launches.
+  disc_concat_real_fake: true
+  # Per-branch schedules, matched by glob against the branch names. A uniform
+  # rotation would claim a 512-window branch costs the same as the envelope bank;
+  # these are the ones worth running at 1/N while the cheap branches supervise
+  # every update. Offsets stagger them so no single update pays for all of them.
+  disc_branch_every:
+    'msstft_*': 2
+    'med_*': 2
+    'periodicity': 4
+    'hf_modulation': 4
+  disc_branch_offset:
+    'med_*': 1
+    'periodicity': 2
+  # The seven generator terms have raw scales that span orders of magnitude, so
+  # their configured weights never meant what they looked like. The balancer
+  # rescales each term's gradient to a fixed SHARE of the update; these weights
+  # are those shares. See look2hear/losses/balancer.py.
+  #
+  # These are NOT the old loss_g weights rescaled. The old weights were small for
+  # the terms with the LARGEST raw gradients -- fullness measures ~3.2e-2 against
+  # freq's 6.7e-4, roughly 50x -- so the weight was fighting the scale. The
+  # balancer divides the scale out, which makes these pure priorities.
+  use_loss_balancer: true
+  balancer_weights:
+    freq: 1.0
+    adv: 1.0
+    fm: 2.0
+    clarity: 0.7
+    waveform: 0.7              # the only term constraining phase
+    fullness: 0.7              # restoring what the codec stripped IS the task
+    bleedless: 0.7             # equal counterweight: the goal here is transparency
+  balancer_total_norm: 1.0
+  balancer_ema_decay: 0.999
+  # Validation runs 6 s segments against training's 3 s, and every item carves its
+  # own allocator blocks. This is the VRAM that climbs after a validation pass and
+  # never comes back down.
+  val_empty_cache: true
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: val_loss
+  patience: 30
+  mode: min
+  verbose: true
+
+checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  dirpath: ${exp.dir}/${exp.name}/checkpoints
+  monitor: val_loss
+  mode: min
+  verbose: true
+  save_top_k: 3
+  save_last: true
+  filename: '{epoch}-{val_loss:.4f}'
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ${exp.dir}/${exp.name}/logs
+  name: ${exp.name}
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  devices: 1
+  max_epochs: 500
+  default_root_dir: ${exp.dir}/${exp.name}/
+  accelerator: cuda
+  precision: 32
+  limit_train_batches: 1.0
+  log_every_n_steps: 50
+  fast_dev_run: false

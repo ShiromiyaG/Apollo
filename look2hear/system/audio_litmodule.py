@@ -46,10 +46,14 @@ class AudioLightningModule(pl.LightningModule):
         scheduler=None,
     ):
         super().__init__()
+        from .restoration_litmodule import _as_module_dict
+
         self.audio_model = model
         self.discriminator = discriminator
         self.optimizer = list(optimizer)
-        self.loss_func = loss_func
+        # losses that carry buffers (e.g. mel filterbanks) only reach the GPU if
+        # they are registered as children, which a bare mapping is not
+        self.loss_func = _as_module_dict(loss_func)
         self.metrics = metrics
         self.scheduler = list(scheduler)
         

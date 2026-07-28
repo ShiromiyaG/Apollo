@@ -1,0 +1,150 @@
+# Lossy -> lossless music restoration, STEREO.
+#
+#   python scripts/preprocess_restoration.py --in_dir ./raw_music --out_dir ./data/music
+#   python train.py --conf_dir=configs/apollo_restoration.yaml --init_from apollo_model.ckpt
+#
+# This is the original Apollo task with the GAN improvements applied: generator
+# EMA, lazy R1, adversarial warmup, branch rotation. See docs/gan.md.
+#
+# Sized for one 8 GB GPU. Stereo costs roughly twice the activations of mono, so
+# segments are shorter here than in the vocal config and checkpointing is on.
+
+exp:
+  dir: ./Exps
+  name: ApolloRestoration
+
+seed: 614020
+matmul_precision: high      # TF32 matmuls; ~free speed on Ampere+ for training
+
+datas:
+  _target_: look2hear.datas.vocal_datamodule.VocalDataModule
+  train_dir: ./data/music/train
+  eval_dir: ./data/music/valid
+  eval_degraded_dir: null
+  sr: 44100
+  segments: 3.0
+  channels: 2               # stereo: this is the restoration model
+  num_samples: 40000
+  gain_range_db: [-6.0, 6.0]
+  min_active_db: -50.0
+  eval_segments: 6.0
+  # music codecs, at the bitrates the paper trained on
+  codec_prob: 0.95
+  codec_formats: [mp3, ogg]
+  bitrates: [24, 32, 48, 64, 96, 128]
+  bandlimit_prob: 0.15
+  clip_prob: 0.05
+  quantize_prob: 0.05
+  batch_size: 1
+  num_workers: 4
+
+model:
+  _target_: look2hear.models.apollo.Apollo
+  sr: 44100
+  win: 20
+  feature_dim: 256
+  layer: 6
+
+discriminator:
+  _target_: look2hear.discriminators.frequencydis.MultiFrequencyDiscriminator
+  nch: 2                    # must match datas.channels
+  hidden_channels: 8
+  # The upstream list starts at 32. A 32-point FFT is 17 bins over 0.7 ms -- that
+  # branch is effectively a time-domain critic and is the one most likely to
+  # reward high-frequency noise. Starting at 128 is the first thing to try if the
+  # output is grainy; put 32 and 64 back if transients go soft.
+  window: [128, 256, 512, 1024, 2048]
+  min_freq_bin: 0
+
+optimizer_g:
+  _target_: torch.optim.AdamW
+  lr: 0.0002
+  weight_decay: 0.01
+
+optimizer_d:
+  _target_: torch.optim.AdamW
+  lr: 0.0001
+  weight_decay: 0.01
+  betas: [0.5, 0.99]
+
+scheduler_g:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+scheduler_d:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+loss_g:
+  _target_: look2hear.losses.gan_losses.VocalGenLoss
+  sr: 44100
+  freq_weight: 1.0
+  adv_weight: 1.0
+  feature_weight: 1.0
+  # For full mixes the fullness/bleedless pair is kept lighter than in the vocal
+  # config -- a mix has content everywhere, so the penalties fire more often.
+  fullness_weight: 0.01
+  bleedless_weight: 0.01
+  clarity_weight: 0.25
+  waveform_weight: 0.5      # the term that constrains phase; nothing else does
+  fullness_band_weights: null
+
+loss_d:
+  _target_: look2hear.losses.gan_losses.MultiFrequencyDisLoss
+  eps: 1e-8
+
+metrics:
+  _target_: look2hear.losses.MultiSrcNegSDR
+  sdr_type: sisdr
+
+system:
+  _target_: look2hear.system.restoration_litmodule.RestorationLightningModule
+  sr: 44100
+  accumulate_grad_batches: 8
+  gradient_clip_val: 5.0
+  autocast_dtype: none
+  gradient_checkpointing: true
+  # --- GAN controls, see docs/gan.md ---
+  ema_decay: 0.999          # exported weights are averaged, not the last step's
+  ema_warmup_steps: 1000
+  use_ema_for_validation: true
+  r1_gamma: 1.0             # 0 disables; bounds how sharp the critic may get
+  r1_every: 16              # lazy regularisation, weight scaled by this internally
+  disc_start_step: 2000     # let reconstruction settle before the critic votes
+  adv_ramp_steps: 2000      # then fade the adversarial terms in
+  disc_branches_per_step: 3 # rotate 3 of 5 branches per step; 0 runs all
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: val_loss
+  patience: 20
+  mode: min
+  verbose: true
+
+checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  dirpath: ${exp.dir}/${exp.name}/checkpoints
+  monitor: val_loss
+  mode: min
+  verbose: true
+  save_top_k: 3
+  save_last: true
+  filename: '{epoch}-{val_loss:.4f}'
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ${exp.dir}/${exp.name}/logs
+  name: ${exp.name}
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  devices: 1
+  max_epochs: 200
+  default_root_dir: ${exp.dir}/${exp.name}/
+  accelerator: cuda
+  precision: 32
+  limit_train_batches: 1.0
+  log_every_n_steps: 50
+  fast_dev_run: false

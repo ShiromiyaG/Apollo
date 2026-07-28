@@ -1,0 +1,12 @@
+# Inference dependencies. Enough to run inference.py.
+#
+# Install PyTorch first, matched to your CUDA version, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements.txt
+
+torch>=2.0
+torchaudio>=2.0
+numpy>=1.23
+soundfile>=0.12          # libsndfile bindings: wav/flac/ogg/mp3, no ffmpeg needed
+huggingface_hub>=0.20    # only used when downloading weights by repo id

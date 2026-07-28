@@ -1,0 +1,301 @@
+# Apollo v2 -- vocal / speech restoration, MONO, trained from scratch.
+#
+#   python scripts/preprocess.py --mode vocal --in_dir ./raw_vocals --out_dir ./data/vocals
+#   python train.py --conf_dir=configs/apollo_v2_vocal.yaml
+#
+# NOT checkpoint-compatible with v1. This used to be a fine-tune of the released
+# Apollo weights; it is now the v2 architecture, so there is no --init_from
+# shortcut and no warm start. Budget for a real training run. If you want the
+# fine-tune path back, point `model` at look2hear.models.apollo.Apollo and lower
+# optimizer_g.lr to 2e-4 -- everything else in this file applies unchanged.
+#
+# Sized for one 8 GB GPU: mono, 3 s segments, batch 1 with gradient accumulation.
+# See docs/vocal_training.md for the objective and docs/gan.md for the GAN.
+
+exp:
+  dir: ./Exps
+  name: ApolloV2Vocal
+
+seed: 614020
+matmul_precision: high
+
+datas:
+  _target_: look2hear.datas.vocal_datamodule.VocalDataModule
+  train_dir: ./data/vocals/train
+  eval_dir: ./data/vocals/valid
+  eval_degraded_dir: null      # set to a parallel folder to use real degraded pairs
+  sr: 44100
+  segments: 3.0
+  channels: 1                  # mono halves activation memory; 2 if you need stereo
+  num_samples: 20000           # "samples per epoch", drawn at random
+  gain_range_db: [-6.0, 6.0]
+  min_active_db: -45.0         # skip crops that are effectively silence
+  eval_segments: 6.0
+  codec_prob: 0.9
+  # A restoration model only learns to undo the artefacts it was shown. `voice` is
+  # a bundle (see look2hear/datas/codec.py) covering what a voice recording
+  # plausibly went through: the MDCT transform codecs, the hybrids, and the
+  # narrowband phone/VoIP family that throws away everything above 4-8 kHz.
+  # Anything the install cannot encode is dropped with a warning at startup, and
+  # if NOTHING can be encoded the run fails rather than silently pairing every
+  # clean segment with an identical copy.
+  codec_formats: [voice]
+  # Uniform sampling would be wrong here: six of the twelve entries resample to 8
+  # or 16 kHz, so half of every epoch would be telephone audio and the model would
+  # treat ordinary 128 kbps MP3 as the edge case. These weights keep the common
+  # cases common while still showing the hard ones often enough to learn them.
+  codec_weights:
+    mp3: 4.0
+    aac: 3.0
+    opus: 2.0
+    ogg: 2.0
+    wma: 1.0
+    amr_wb: 1.0                # 16 kHz: modern mobile telephony
+    g722: 1.0                  # 16 kHz: VoIP / conferencing
+    speex: 0.7
+    amr_nb: 0.7                # 8 kHz: the hardest case in the set
+    gsm: 0.5
+    g726: 0.5
+    mulaw: 0.5
+  bitrates: [16, 24, 32, 48, 64, 96]
+  bandlimit_prob: 0.3
+  clip_prob: 0.1
+  quantize_prob: 0.1
+  batch_size: 1
+  num_workers: 4               # set to 0 on Windows if dataloader workers misbehave
+
+model:
+  _target_: look2hear.models.apollo_v2.ApolloV2
+  sr: 44100
+  win: 20
+  feature_dim: 256
+  layer: 6
+  icb_blocks: 2
+  icb_kernel: 11
+  icb_mult: 2.5
+  icb_dilations: [1, 2]
+  ffn_mult: 2.67
+  output_mode: residual        # predict a correction to the input spectrum
+  stereo_mode: lr              # no-op at channels: 1; ms only engages on 2ch input
+  output_init_scale: 0.1
+
+discriminator:
+  _target_: look2hear.discriminators.build_fast_discriminator
+  nch: 1                       # must match datas.channels
+  sample_rate: 44100
+  use_san: true                # bounds each branch's logit without spectral norm
+  use_mpd: true                # period domain: pitch, buzz
+  use_mrd: true                # multi-resolution magnitude
+  use_mel: true                # log-frequency, cheap stand-in for a CQT branch
+  phase_aware: true            # complex-STFT branch: the ONLY thing constraining phase
+  periods: [2, 3, 5, 7, 11]
+  mrd_fft_sizes: [2048, 1024, 512]
+  mrd_hop_sizes: [256, 128, 64]
+  mrd_win_lengths: [2048, 1024, 512]
+  mel_fft_sizes: [2048]
+  mel_hop_sizes: [512]
+  mel_win_lengths: [2048]
+  n_mels: 128
+  msstft_n_ffts: [2048, 1024, 512]
+  msstft_freq_stride: 2
+  msstft_mag_compression: 0.3  # without it the branch behaves as a low-band critic
+  # --- dynamics branches (see look2hear/discriminators/dynamics.py) ---
+  # These matter more for voice than for music. Everything above judges a static
+  # picture; a codec at 24 kbps smears consonant attacks, fills the pauses between
+  # words with hiss at roughly the right LEVEL and the wrong movement, and flattens
+  # the breath and swell of a sung note. No spectral branch can object to any of
+  # that, and neither can fullness/bleedless, which are level penalties.
+  use_med: true                # 3 envelope time constants: ~1.5 / 6 / 23 ms
+  use_transient: true          # waveform derivative: plosives, consonant attacks
+  use_hf_modulation: true      # fricative texture vs static hiss
+  use_periodicity: true        # the over-regular, "plastic" voiced comb
+  med_channels: 32
+  # 1-8 kHz rather than the music config's 2-10 kHz: sibilance and fricative
+  # texture live lower for voice than for a full mix's air band.
+  hf_low_hz: 1000.0
+  hf_high_hz: 8000.0
+  # speech and sung voice, from a low male fundamental to a high soprano
+  periodicity_f0_min: 70.0
+  periodicity_f0_max: 500.0
+
+# fused: one kernel for the whole parameter update. Measured 4.74 -> 1.65 ms per
+# step on 22.1M parameters, but with accumulate_grad_batches: 8 that is ~0.07% end
+# to end. On because it is free, not because it is a win at this accumulation.
+optimizer_g:
+  _target_: torch.optim.AdamW
+  lr: 0.0008                   # from scratch, not a fine-tune
+  weight_decay: 0.01
+  fused: true
+
+optimizer_d:
+  _target_: torch.optim.AdamW
+  lr: 0.0002
+  weight_decay: 0.01
+  betas: [0.5, 0.99]
+  fused: true
+
+scheduler_g:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+scheduler_d:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: 2
+  gamma: 0.98
+
+# With the balancer on (system.use_loss_balancer) these weights no longer set the
+# relative importance of the terms -- system.balancer_weights does. They are left
+# at 1.0 because a constant prefactor cancels out of the balancer entirely: it
+# divides by the gradient's own norm, which carries the prefactor with it.
+loss_g:
+  _target_: look2hear.losses.gan_losses.VocalGenLoss
+  sr: 44100
+  freq_weight: 1.0
+  adv_weight: 1.0
+  feature_weight: 1.0
+  fullness_weight: 1.0
+  bleedless_weight: 1.0
+  clarity_weight: 1.0
+  waveform_weight: 1.0
+  # The one loss_g knob the balancer does NOT neutralise, because it is not a
+  # constant prefactor: it reweights WITHIN the fullness term, emphasising the band
+  # that carries consonants and presence.
+  fullness_band_weights: [[300.0, 8000.0, 1.5]]
+  # RpGAN: judge the paired real-vs-fake difference rather than each against an
+  # absolute boundary. Valid here because the generator's input is a degraded copy
+  # of the very target it is scored against. Set to soft_hinge (or lsgan) to drop
+  # the relativistic pairing -- loss_d.loss_type must match.
+  gan_loss_type: relativistic
+
+loss_d:
+  _target_: look2hear.losses.gan_losses.MultiFrequencyDisLoss
+  eps: 1e-8
+  loss_type: relativistic      # must match loss_g.gan_loss_type
+
+metrics:
+  _target_: look2hear.losses.MultiSrcNegSDR
+  sdr_type: sisdr
+
+system:
+  _target_: look2hear.system.restoration_litmodule.RestorationLightningModule
+  sr: 44100
+  accumulate_grad_batches: 8   # effective batch 8 at the memory cost of 1
+  gradient_clip_val: 5.0
+  # bf16: measured 1.45x faster and -26% memory on the stereo music config with the
+  # same critic. Mono is cheaper still, so there is headroom either way. Safe here
+  # because the gradient penalty runs outside autocast, the dynamics branches keep
+  # their front-ends in fp32, and the balancer keeps its statistics in fp32 -- at
+  # decay 0.999 a bf16 EMA does not move at all (0 of 200 updates, measured).
+  # Set to `none` if the adversarial game destabilises. See docs/gan.md.
+  autocast_dtype: bf16
+  gradient_checkpointing: true # ~one extra forward of compute, large memory win, exact
+  # --- GAN controls, see docs/gan.md ---
+  ema_decay: 0.999             # exported weights are averaged, not the last step's
+  ema_warmup_steps: 2000
+  use_ema_for_validation: true
+  # R3GAN: the relativistic objective above plus a zero-centred gradient penalty on
+  # BOTH sides. r2_gamma is the fake-side half.
+  r1_gamma: 1.0
+  r2_gamma: 1.0
+  r1_every: 16                 # counted in DISCRIMINATOR UPDATES, not micro-batches
+  r1_patch_reduction: mean     # `sum` reproduces pre-fix runs; see docs/gan.md
+  # Penalise each branch's own gradient (mean_b ||g_b||^2) rather than the norm of
+  # the summed field (||mean_b g_b||^2). Not a memory trade with the same meaning:
+  # branch gradients are near-uncorrelated, so the cross terms cancel and the
+  # summed form lands ~n_branches lower -- measured exactly 8.0x on an 8-branch
+  # bank. With disc_branchwise: true this was already the behaviour; setting it
+  # explicitly stops r1_gamma's meaning from riding on an unrelated flag.
+  r1_branchwise: true
+  # Both penalties out of ONE forward and ONE double backward instead of two. The
+  # double backward is what makes a regularisation step expensive, and samples are
+  # independent, so cat([real, fake]) yields both halves' per-sample gradients at
+  # once. Identical numbers; the trade is a larger peak on that one step.
+  r1_r2_joined: true
+  # Hold the critic's LR schedule until the critic has actually stepped. Without
+  # this a StepLR decays through the whole 5000-step warmup and the critic wakes
+  # up already annealed.
+  hold_disc_scheduler: true
+  disc_start_step: 5000        # from scratch: give reconstruction longer to settle
+  adv_ramp_steps: 5000         # counted in OPTIMIZER WINDOWS
+  disc_branches_per_step: 0    # superseded by disc_branch_every below
+  # forward+backward one branch at a time: peak tracks the largest single branch
+  # rather than the sum over all 18
+  disc_branchwise: true
+  # Stop the per-branch backwards at the generated waveform and accumulate there,
+  # so the generator graph is traversed ONCE instead of once per branch. Measured
+  # 9.4x on the generator step. Identical gradients -- see tests/test_gan_v2.py.
+  gstep_output_grad: true
+  # one critic forward over cat([real, fake]) instead of two
+  disc_concat_real_fake: true
+  # Per-branch schedules, matched by glob against the branch names. The expensive
+  # branches run at 1/N while the cheap ones supervise every update; offsets
+  # stagger them so no single update pays for all of them.
+  disc_branch_every:
+    'msstft_*': 2
+    'med_*': 2
+    'periodicity': 4
+    'hf_modulation': 4
+  disc_branch_offset:
+    'med_*': 1
+    'periodicity': 2
+  # The seven generator terms have raw scales that span orders of magnitude, so
+  # their configured weights never meant what they looked like. The balancer
+  # rescales each term's gradient to a fixed SHARE of the update; these weights are
+  # those shares. Watch train/bal_* -- the effective gradient norms -- not the raw
+  # losses.
+  #
+  # These are NOT the old loss_g weights rescaled. The old `fullness_weight: 0.02`
+  # was small because that term has by far the LARGEST raw gradient -- measured,
+  # its norm is ~3.2e-2 against freq's 6.7e-4, roughly 50x. The weight had to
+  # fight the scale. The balancer divides the scale out, so carrying the old ratio
+  # over here would have demoted fullness to a twentieth of clarity's influence --
+  # in the one mode whose entire purpose is a fuller-sounding voice. Shares are
+  # priorities now, and fullness is a priority.
+  use_loss_balancer: true
+  balancer_weights:
+    freq: 1.0
+    adv: 1.0
+    fm: 2.0
+    clarity: 1.0               # log-mel L1 weighted to 300 Hz - 8 kHz
+    waveform: 1.0              # the only term constraining phase
+    fullness: 1.0              # the "fuller voice" goal, on par with the rest
+    bleedless: 0.7             # its counterweight: without it, "fuller" invites hiss
+  balancer_total_norm: 1.0
+  balancer_ema_decay: 0.999
+  # validation runs 6 s against training's 3 s and each item carves its own
+  # allocator blocks; this is the VRAM that climbs after a validation pass
+  val_empty_cache: true
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: val_loss
+  patience: 30
+  mode: min
+  verbose: true
+
+checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  dirpath: ${exp.dir}/${exp.name}/checkpoints
+  monitor: val_loss
+  mode: min
+  verbose: true
+  save_top_k: 3
+  save_last: true
+  filename: '{epoch}-{val_loss:.4f}'
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ${exp.dir}/${exp.name}/logs
+  name: ${exp.name}
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  devices: 1
+  max_epochs: 500              # from scratch, not a fine-tune
+  default_root_dir: ${exp.dir}/${exp.name}/
+  accelerator: cuda
+  precision: 32
+  limit_train_batches: 1.0
+  log_every_n_steps: 50
+  fast_dev_run: false
